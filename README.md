@@ -71,6 +71,31 @@ Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
 | POST | `/stripe/webhook` | Stripe webhook |
 | GET | `/subscription/{user_id}` | Get subscription status |
 
+### Email Verification
+| Variable | Description |
+|----------|-------------|
+| `SMTP_HOST` | SMTP server (e.g. `smtp.gmail.com`) |
+| `SMTP_PORT` | SMTP port (default `587`) |
+| `SMTP_USER` | SMTP login email |
+| `SMTP_PASSWORD` | SMTP password or app password |
+| `SMTP_FROM` | From address (default `noreply@brillance.app`) |
+| `FRONTEND_URL` | Frontend URL for verification links |
+| `JWT_SECRET` | JWT signing secret (auto-generated if missing) |
+
+If SMTP is not configured, verification links are logged to console.
+
+## Auth API
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/auth/signup` | No | Create account (sends verification email) |
+| POST | `/auth/verify-email` | No | Verify email with token |
+| POST | `/auth/signin` | No | Sign in (returns JWT, 7-day expiry) |
+| GET | `/auth/me` | JWT | Get current user profile |
+| POST | `/auth/resend-verification` | No | Resend verification email |
+
+Protected endpoints require `Authorization: Bearer <token>` header.
+
 ## Configuration
 
 Set these as Railway environment variables:

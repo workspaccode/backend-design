@@ -1,20 +1,40 @@
 import os
 import re
 import json
+import smtplib
+import logging
+from email.mime.text import MIMEText
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
 import uvicorn
 import requests
+import jwt
+from passlib.context import CryptContext
 from db import DatabaseManager
 from design_system import generate_full_system, generate_flutter_theme, generate_css_variables, generate_json_tokens, generate_figma_script, generate_tailwind_config
 from figma_parser import parse_figma_url
 from svg_parser import parse_svg
 from limits import check_limit
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("brillance")
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# JWT config
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production-" + os.urandom(16).hex())
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_DAYS = 7
+
+security = HTTPBearer(auto_error=False)
 
 app = FastAPI(title="Brillance API", version="1.0.0")
 db = DatabaseManager()
@@ -23,7 +43,12 @@ db = DatabaseManager()
 # Enable CORS for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://brillance.pages.dev",
+        "https://convert-gen.workers.dev",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -79,6 +104,12 @@ class ParseElementRequest(BaseModel):
     context_css: Optional[str] = ""
     project_id: Optional[str] = None
 
+class FullPageRequest(BaseModel):
+    html: str
+    conversion_type: Optional[str] = "full_page"
+    options: Optional[Dict[str, Any]] = None
+    user_id: Optional[str] = None
+
 class FigmaUrlRequest(BaseModel):
     figma_url: str
     access_token: str
@@ -86,6 +117,233 @@ class FigmaUrlRequest(BaseModel):
 
 class FigmaFileUpload(BaseModel):
     project_id: Optional[str] = None
+
+
+# ========== AUTH MODELS ==========
+
+class AuthSignupRequest(BaseModel):
+    email: str
+    password: str
+    full_name: str = ""
+
+class AuthSigninRequest(BaseModel):
+    email: str
+    password: str
+
+class AuthVerifyRequest(BaseModel):
+    token: str
+
+class AuthResendRequest(BaseModel):
+    email: str
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    full_name: str = ""
+    email_verified: bool = False
+    created_at: str = ""
+
+class AuthResponse(BaseModel):
+    user: UserResponse
+    access_token: str
+    expires_at: str
+
+
+# ========== JWT HELPERS ==========
+
+def create_jwt(user_id: str, email: str) -> tuple[str, str]:
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRY_DAYS))
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "iat": datetime.now(timezone.utc),
+        "exp": expires_at,
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return token, expires_at.isoformat()
+
+def decode_jwt(token: str) -> Optional[Dict[str, Any]]:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Optional[Dict[str, Any]]:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = decode_jwt(credentials.credentials)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user = db.get_user_by_id(payload["sub"])
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+# ========== EMAIL HELPER ==========
+
+EMAIL_ENABLED = bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_USER"))
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", "noreply@brillance.app")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+
+def send_verification_email(to_email: str, token: str, full_name: str = ""):
+    verify_link = f"{FRONTEND_URL}/verify-email?token={token}"
+    name = full_name or to_email.split("@")[0]
+    html = f"""<!DOCTYPE html>
+<html><body style="font-family:sans-serif;background:#f5f5f7;padding:40px">
+<div style="max-width:480px;margin:auto;background:#fff;border-radius:12px;padding:32px">
+<div style="font-size:28px;font-weight:700;color:#7C6AF7;margin-bottom:8px">Brillance</div>
+<p style="color:#333;font-size:15px;line-height:1.5">Hi {name},<br><br>
+Thanks for signing up! Please verify your email address to get started.</p>
+<a href="{verify_link}"
+   style="display:inline-block;background:#7C6AF7;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:15px;font-weight:600;margin:16px 0">
+   Verify Email
+</a>
+<p style="color:#999;font-size:13px">Or copy this link:<br><span style="color:#7C6AF7;font-size:12px">{verify_link}</span></p>
+<p style="color:#999;font-size:12px;margin-top:24px">This link expires in 48 hours.</p>
+</div></body></html>"""
+
+    if not EMAIL_ENABLED:
+        logger.info(f"=== EMAIL VERIFICATION ({to_email}) ===")
+        logger.info(f"Link: {verify_link}")
+        logger.info("=== SMTP not configured — set SMTP_HOST/SMTP_USER/SMTP_PASSWORD to send real emails ===")
+        return
+
+    try:
+        msg = MIMEText(html, "html")
+        msg["Subject"] = "Verify your Brillance email"
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_email
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        logger.info(f"Verification email sent to {to_email}")
+    except Exception as e:
+        logger.error(f"Failed to send email to {to_email}: {e}")
+
+
+# ========== AUTH ENDPOINTS ==========
+
+@app.post("/auth/signup", response_model=AuthResponse)
+async def auth_signup(req: AuthSignupRequest):
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    existing = db.get_user_by_email(req.email)
+    if existing:
+        if existing.get("email_verified"):
+            raise HTTPException(status_code=409, detail="Email already registered")
+        # resend verification
+        token_data = db.create_verification_token(existing["id"])
+        if token_data:
+            send_verification_email(req.email, token_data["token"], req.full_name)
+        raise HTTPException(status_code=409, detail="Email already registered. A new verification email has been sent.")
+
+    password_hash = pwd_context.hash(req.password)
+    user = db.create_user(req.email, password_hash, req.full_name)
+    if not user:
+        raise HTTPException(status_code=500, detail="Failed to create user")
+
+    token_data = db.create_verification_token(user["id"])
+    if token_data:
+        send_verification_email(req.email, token_data["token"], req.full_name)
+
+    jwt_token, expires_at = create_jwt(user["id"], req.email)
+    return AuthResponse(
+        user=UserResponse(
+            id=user["id"],
+            email=user["email"],
+            full_name=user.get("full_name", req.full_name),
+            email_verified=False,
+            created_at=user.get("created_at", ""),
+        ),
+        access_token=jwt_token,
+        expires_at=expires_at,
+    )
+
+@app.post("/auth/verify-email")
+async def auth_verify_email(req: AuthVerifyRequest):
+    token_record = db.get_verification_token(req.token)
+    if not token_record:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification token")
+    if token_record.get("used"):
+        raise HTTPException(status_code=400, detail="Token already used")
+    expires_at = token_record.get("expires_at", "")
+    if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Verification token has expired")
+
+    db.verify_user_email(token_record["user_id"])
+    db.use_verification_token(token_record["id"])
+
+    user = db.get_user_by_id(token_record["user_id"])
+    jwt_token, jwt_expires_at = create_jwt(user["id"], user["email"])
+    return AuthResponse(
+        user=UserResponse(
+            id=user["id"],
+            email=user["email"],
+            full_name=user.get("full_name", ""),
+            email_verified=True,
+            created_at=user.get("created_at", ""),
+        ),
+        access_token=jwt_token,
+        expires_at=jwt_expires_at,
+    )
+
+@app.post("/auth/signin", response_model=AuthResponse)
+async def auth_signin(req: AuthSigninRequest):
+    user = db.get_user_by_email(req.email)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not pwd_context.verify(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not user.get("email_verified"):
+        raise HTTPException(status_code=403, detail="Please verify your email before signing in")
+
+    db.update_last_signin(user["id"])
+    jwt_token, expires_at = create_jwt(user["id"], user["email"])
+    return AuthResponse(
+        user=UserResponse(
+            id=user["id"],
+            email=user["email"],
+            full_name=user.get("full_name", ""),
+            email_verified=True,
+            created_at=user.get("created_at", ""),
+        ),
+        access_token=jwt_token,
+        expires_at=expires_at,
+    )
+
+@app.get("/auth/me", response_model=UserResponse)
+async def auth_me(user: Optional[Dict[str, Any]] = Depends(get_current_user)):
+    return UserResponse(
+        id=user["id"],
+        email=user["email"],
+        full_name=user.get("full_name", ""),
+        email_verified=bool(user.get("email_verified")),
+        created_at=user.get("created_at", ""),
+    )
+
+@app.post("/auth/resend-verification")
+async def auth_resend_verification(req: AuthResendRequest):
+    user = db.get_user_by_email(req.email)
+    if not user:
+        raise HTTPException(status_code=404, detail="Email not found")
+    if user.get("email_verified"):
+        raise HTTPException(status_code=400, detail="Email already verified")
+    token_data = db.create_verification_token(user["id"])
+    if token_data:
+        send_verification_email(req.email, token_data["token"], user.get("full_name", ""))
+    return {"message": "Verification email sent"}
 
 
 # Helper to extract style attributes from raw inline style strings
@@ -560,64 +818,127 @@ async def save_raw_html(project_id: str, file: UploadFile = File(...)):
     return {"success": True, "project_id": project_id}
 
 
-@app.get("/preview/{project_id}")
-async def preview_html(project_id: str):
-    raw = db.get_project_raw_html(project_id)
-    if not raw:
-        raise HTTPException(status_code=404, detail="No HTML found for this project")
-    
-    injection_script = """
+def get_injection_script(mode: str) -> str:
+    return f"""
 <script>
-(function() {
-  let selectedEl = null;
-  
-  document.addEventListener('click', function(e) {
+(function() {{
+  const mode = {json.dumps(mode)};
+  let currentOutlineEl = null;
+
+  function isNearBorder(e, rect, threshold = 8) {{
+    const x = e.clientX;
+    const y = e.clientY;
+    const nearLeft = Math.abs(x - rect.left) <= threshold;
+    const nearRight = Math.abs(x - rect.right) <= threshold;
+    const nearTop = Math.abs(y - rect.top) <= threshold;
+    const nearBottom = Math.abs(y - rect.bottom) <= threshold;
+    return nearLeft || nearRight || nearTop || nearBottom;
+  }}
+
+  function clearOutline() {{
+    if (currentOutlineEl) {{
+      currentOutlineEl.style.outline = currentOutlineEl._brillancePrevOutline || 'none';
+      currentOutlineEl.style.outlineOffset = '';
+      currentOutlineEl = null;
+    }}
+  }}
+
+  document.addEventListener('mousemove', function(e) {{
+    const el = e.target;
+    if (!el || el === document.body || el === document.documentElement) {{
+      clearOutline();
+      return;
+    }}
+    
+    const rect = el.getBoundingClientRect();
+    
+    if (mode === 'container') {{
+      const nearBorder = isNearBorder(e, rect, 8);
+      const targetEl = nearBorder ? (el.parentElement || el) : el;
+      
+      if (currentOutlineEl !== targetEl) {{
+        clearOutline();
+        currentOutlineEl = targetEl;
+        targetEl._brillancePrevOutline = targetEl.style.outline;
+        targetEl.style.outline = nearBorder ? '2px dashed #a78bfa' : '2px solid #0a84ff';
+        targetEl.style.outlineOffset = '2px';
+        targetEl.style.cursor = 'pointer';
+      }}
+    }} else if (mode === 'single') {{
+      if (currentOutlineEl !== el) {{
+        clearOutline();
+        currentOutlineEl = el;
+        el._brillancePrevOutline = el.style.outline;
+        el.style.outline = '2px solid #7C6AF7';
+        el.style.outlineOffset = '2px';
+        el.style.cursor = 'pointer';
+      }}
+    }}
+  }}, true);
+
+  document.addEventListener('mouseout', function(e) {{
+    if (e.target === currentOutlineEl) {{
+      clearOutline();
+    }}
+  }}, true);
+
+  document.addEventListener('click', function(e) {{
     e.preventDefault();
     e.stopPropagation();
     
-    const el = e.target;
-    const styles = window.getComputedStyle(el);
+    let target = e.target;
+    if (!target || target === document.body || target === document.documentElement) return;
+
+    if (mode === 'container') {{
+      const rect = target.getBoundingClientRect();
+      const nearBorder = isNearBorder(e, rect, 8);
+      target = nearBorder ? (target.parentElement || target) : target;
+    }}
     
-    // Remove previous highlight
-    if (selectedEl) {
-      selectedEl.style.outline = selectedEl._brillancePrevOutline || 'none';
-    }
+    const styles = window.getComputedStyle(target);
     
-    // Save current outline and highlight
-    selectedEl = el;
-    el._brillancePrevOutline = el.style.outline;
-    el.style.outline = '2px solid #7C6AF7';
-    el.style.outlineOffset = '2px';
+    // Save previous state to strip outline from outerHTML
+    const prevOutline = target.style.outline;
+    const prevOffset = target.style.outlineOffset;
+    target.style.outline = target._brillancePrevOutline || '';
+    target.style.outlineOffset = '';
     
-    window.parent.postMessage({
-      type: 'ELEMENT_SELECTED',
-      html: el.outerHTML,
-      tagName: el.tagName,
-      computedStyles: {
+    const outerHTML = target.outerHTML;
+    
+    // Restore
+    target.style.outline = prevOutline;
+    target.style.outlineOffset = prevOffset;
+    
+    window.parent.postMessage({{
+      type: mode === 'container' ? 'CONTAINER_SELECTED' : 'ELEMENT_SELECTED',
+      html: outerHTML,
+      childCount: target.children.length,
+      tagName: target.tagName,
+      computedStyles: {{
         color: styles.color,
         backgroundColor: styles.backgroundColor,
         fontSize: styles.fontSize,
         borderRadius: styles.borderRadius,
         padding: styles.padding,
         fontWeight: styles.fontWeight,
-      },
-      bounds: {
-        w: el.offsetWidth,
-        h: el.offsetHeight,
-      }
-    }, '*');
-  }, true);
-  
-  // Also add hover preview cursor
-  document.addEventListener('mouseover', function(e) {
-    if (e.target !== selectedEl) {
-      e.target.style.cursor = 'pointer';
-    }
-  }, true);
-})();
+      }},
+      bounds: {{
+        w: target.offsetWidth,
+        h: target.offsetHeight,
+      }}
+    }}, '*');
+  }}, true);
+}})();
 </script>
 """
+
+@app.get("/preview/{project_id}")
+async def preview_html(project_id: str, mode: str = "single"):
+    raw = db.get_project_raw_html(project_id)
+    if not raw:
+        raise HTTPException(status_code=404, detail="No HTML found for this project")
     
+    injection_script = get_injection_script(mode)
     modified = raw.replace("</body>", f"{injection_script}</body>") if "</body>" in raw else raw + injection_script
     return HTMLResponse(content=modified)
 
@@ -638,49 +959,297 @@ async def serve_temp_html(file: UploadFile = File(...)):
 
 
 @app.get("/preview/temp/{temp_id}")
-async def get_temp_preview(temp_id: str):
+async def get_temp_preview(temp_id: str, mode: str = "single"):
     html_content = _temp_html_storage.get(temp_id)
     if not html_content:
         raise HTTPException(status_code=404, detail="Temporary HTML not found or expired")
 
-    injection_script = """
-<script>
-(function() {
-  let selectedEl = null;
-  document.addEventListener('click', function(e) {
-    e.preventDefault(); e.stopPropagation();
-    const el = e.target;
-    const styles = window.getComputedStyle(el);
-    if (selectedEl) {
-      selectedEl.style.outline = selectedEl._brillancePrevOutline || 'none';
-    }
-    selectedEl = el;
-    el._brillancePrevOutline = el.style.outline;
-    el.style.outline = '2px solid #7C6AF7';
-    el.style.outlineOffset = '2px';
-    window.parent.postMessage({
-      type: 'ELEMENT_SELECTED',
-      html: el.outerHTML,
-      tagName: el.tagName,
-      computedStyles: {
-        color: styles.color,
-        backgroundColor: styles.backgroundColor,
-        fontSize: styles.fontSize,
-        borderRadius: styles.borderRadius,
-        padding: styles.padding,
-        fontWeight: styles.fontWeight,
-      },
-      bounds: { w: el.offsetWidth, h: el.offsetHeight }
-    }, '*');
-  }, true);
-  document.addEventListener('mouseover', function(e) {
-    if (e.target !== selectedEl) e.target.style.cursor = 'pointer';
-  }, true);
-})();
-</script>
-"""
+    injection_script = get_injection_script(mode)
     modified = html_content.replace("</body>", f"{injection_script}</body>") if "</body>" in html_content else html_content + injection_script
     return HTMLResponse(content=modified)
+
+
+async def call_openai(prompt: str, fallback_widget_name: str = "CustomWidget") -> str:
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        try:
+            headers = {
+                "Authorization": f"Bearer {openai_key}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2
+            }
+            response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data, timeout=15)
+            if response.status_code == 200:
+                result = response.json()
+                code = result["choices"][0]["message"]["content"]
+                code = re.sub(r"^```dart\n|```$", "", code, flags=re.MULTILINE)
+                return code.strip()
+        except Exception as e:
+            logger.error(f"OpenAI call failed: {e}")
+            pass
+            
+    # Rule-based fallback if OpenAI is not available
+    tag_name = fallback_widget_name.lower()
+    if "navbar" in tag_name or "nav" in tag_name:
+        return f"""import 'package:flutter/material.dart';
+
+class {fallback_widget_name} extends StatelessWidget {{
+  const {fallback_widget_name}({{super.key}});
+  
+  @override
+  Widget build(BuildContext context) {{
+    return Container(
+      height: 60,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        border: Border(
+          bottom: BorderSide(
+            color: Theme.of(context).dividerColor,
+            width: 1,
+          ),
+        ),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.widgets, color: Theme.of(context).colorScheme.primary),
+              const SizedBox(width: 8),
+              Text(
+                'Brillance App',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Theme.of(context).colorScheme.onSurface,
+                ),
+              ),
+            ],
+          ),
+          Row(
+            children: [
+              TextButton(onPressed: () {{}}, child: const Text('Home')),
+              TextButton(onPressed: () {{}}, child: const Text('Features')),
+              TextButton(onPressed: () {{}}, child: const Text('Pricing')),
+            ],
+          ),
+          ElevatedButton(
+            onPressed: () {{}},
+            child: const Text('Get Started'),
+          ),
+        ],
+      ),
+    );
+  }}
+}}
+"""
+    elif "footer" in tag_name:
+        return f"""import 'package:flutter/material.dart';
+
+class {fallback_widget_name} extends StatelessWidget {{
+  const {fallback_widget_name}({{super.key}});
+  
+  @override
+  Widget build(BuildContext context) {{
+    return Container(
+      padding: const EdgeInsets.all(32),
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                '© 2026 Brillance Inc. All rights reserved.',
+                style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+              ),
+              Row(
+                children: [
+                  IconButton(onPressed: () {{}}, icon: const Icon(Icons.link)),
+                  IconButton(onPressed: () {{}}, icon: const Icon(Icons.share)),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }}
+}}
+"""
+    else:
+        return f"""import 'package:flutter/material.dart';
+
+class {fallback_widget_name} extends StatelessWidget {{
+  const {fallback_widget_name}({{super.key}});
+  
+  @override
+  Widget build(BuildContext context) {{
+    return Container(
+      padding: const EdgeInsets.all(24),
+      margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.05),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '{fallback_widget_name}',
+            style: Theme.of(context).textTheme.titleLarge?.copyWith(
+              fontWeight: FontWeight.bold,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'This is a parsed {fallback_widget_name} section converted into a responsive Flutter widget.',
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton(
+            onPressed: () {{}},
+            child: const Text('Action Button'),
+          ),
+        ],
+      ),
+    );
+  }}
+}}
+"""
+
+def generate_widget_name(section: dict) -> str:
+    tag = section['tag']
+    classes = section.get('classes', [])
+    sid = section.get('id', '')
+    
+    if tag == 'nav': return 'AppNavBar'
+    if tag == 'header': return 'AppHeader'
+    if tag == 'footer': return 'AppFooter'
+    if sid: return ''.join(w.capitalize() for w in sid.split('-')) + 'Section'
+    if classes and isinstance(classes, list):
+        return ''.join(w.capitalize() for w in classes[0].split('-')) + 'Section'
+    return f'Section{abs(hash(section["html"])) % 1000}'
+
+def generate_screen_widget(widget_names: list) -> str:
+    def to_snake(name):
+        return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
+        
+    imports_code = '\n'.join([f"import '{to_snake(name)}.dart';" for name in widget_names])
+    widgets_code = '\n'.join([f'            {name}(),' for name in widget_names])
+    return f"""import 'package:flutter/material.dart';
+{imports_code}
+
+class GeneratedPage extends StatelessWidget {{
+  const GeneratedPage({{super.key}});
+  
+  @override
+  Widget build(BuildContext context) {{
+    return Scaffold(
+      body: SingleChildScrollView(
+        child: Column(
+          children: [
+{widgets_code}
+          ],
+        ),
+      ),
+    );
+  }}
+}}
+"""
+
+@app.post("/generate/flutter/page")
+async def generate_full_page(request: FullPageRequest):
+    html = request.html
+    
+    # 1. Parse HTML and extract sections
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    body = soup.find('body') or soup
+    
+    # If there is a single main wrapper child, look into it
+    direct_children = [c for c in body.children if c.name]
+    if len(direct_children) == 1 and direct_children[0].name in ['div', 'main']:
+        body = direct_children[0]
+        
+    sections = []
+    # Find all main sections
+    for child in body.find_all(['nav', 'header', 'section', 'main', 'footer', 'div'], recursive=False):
+        if len(str(child)) > 100:
+            sections.append({
+                'tag': child.name,
+                'id': child.get('id', ''),
+                'classes': child.get('class', []),
+                'html': str(child)[:3000]
+            })
+            
+    # If no top-level sections were found, find any section, nav, header, footer, or large divs
+    if not sections:
+        for item in body.find_all(['nav', 'header', 'section', 'footer', 'div']):
+            if len(str(item)) > 200 and not any(str(item) in s['html'] for s in sections):
+                sections.append({
+                    'tag': item.name,
+                    'id': item.get('id', ''),
+                    'classes': item.get('class', []),
+                    'html': str(item)[:3000]
+                })
+                if len(sections) >= 8:
+                    break
+
+    # 2. Generate Flutter code for each section
+    widgets = []
+    seen_names = set()
+    for i, section in enumerate(sections[:8]):
+        base_name = generate_widget_name(section)
+        widget_name = base_name
+        counter = 1
+        while widget_name in seen_names:
+            widget_name = f"{base_name}_{counter}"
+            counter += 1
+        seen_names.add(widget_name)
+        
+        prompt = f"""
+        Convert this HTML section to a Flutter StatelessWidget.
+        Widget name: {widget_name}
+        HTML:
+        {section['html']}
+        
+        Rules:
+        - Use Material 3
+        - Use Theme.of(context) for colors
+        - Make it responsive with LayoutBuilder
+        - Add RTL support with Directionality
+        - Return ONLY the Dart code, no explanation
+        """
+        
+        code = await call_openai(prompt, fallback_widget_name=widget_name)
+        widgets.append({
+            'name': widget_name,
+            'section': section['tag'],
+            'code': code
+        })
+        
+    # 3. Generate main Screen widget
+    widget_names = [w['name'] for w in widgets]
+    screen_code = generate_screen_widget(widget_names)
+    
+    return {
+        'screen_code': screen_code,
+        'widgets': widgets,
+        'total_widgets': len(widgets)
+    }
 
 
 # Generate Flutter widget code from ComponentTree

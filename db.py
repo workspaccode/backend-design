@@ -3,6 +3,9 @@ import sqlite3
 import json
 import uuid
 import io
+import hashlib
+import secrets
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import requests
 from urllib.parse import urljoin
@@ -95,6 +98,7 @@ class DatabaseManager:
         self._init_selected_components()
         self._init_design_systems()
         self._init_usage_tracking()
+        self._init_auth()
 
     def _init_usage_tracking(self):
         conn = sqlite3.connect(self.db_path)
@@ -921,3 +925,239 @@ class DatabaseManager:
             except Exception as e:
                 print(f"SQLite GET raw_html exception: {str(e)}")
                 return None
+
+    # ========== AUTH ==========
+
+    def _init_auth(self):
+        if self.use_supabase:
+            return
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            full_name TEXT DEFAULT '',
+            email_verified INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_signin_at TIMESTAMP
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS verification_tokens (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            type TEXT DEFAULT 'email_verification',
+            expires_at TIMESTAMP NOT NULL,
+            used INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """)
+        conn.commit()
+        conn.close()
+
+    def create_user(self, email: str, password_hash: str, full_name: str = "") -> Optional[Dict[str, Any]]:
+        user_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+        if self.use_supabase:
+            try:
+                url = f"{self.base_url}/users"
+                payload = {"id": user_id, "email": email, "password_hash": password_hash, "full_name": full_name, "created_at": now}
+                res = requests.post(url, headers=self.headers, json=payload, timeout=10)
+                if res.status_code in (200, 201):
+                    return res.json()[0] if isinstance(res.json(), list) else res.json()
+                return None
+            except Exception as e:
+                print(f"Supabase create_user exception: {str(e)}")
+                return None
+        else:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO users (id, email, password_hash, full_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, email, password_hash, full_name, now),
+                )
+                conn.commit()
+                conn.close()
+                return {"id": user_id, "email": email, "full_name": full_name, "email_verified": 0, "created_at": now}
+            except sqlite3.IntegrityError:
+                return None
+            except Exception as e:
+                print(f"SQLite create_user exception: {str(e)}")
+                return None
+
+    def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        if self.use_supabase:
+            try:
+                url = f"{self.base_url}/users?email=eq.{email}&select=*"
+                res = requests.get(url, headers=self.headers, timeout=10)
+                if res.status_code == 200 and res.json():
+                    return res.json()[0]
+                return None
+            except Exception as e:
+                print(f"Supabase get_user_by_email exception: {str(e)}")
+                return None
+        else:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
+                row = cursor.fetchone()
+                conn.close()
+                if row:
+                    cols = [d[0] for d in cursor.description]
+                    return dict(zip(cols, row))
+                return None
+            except Exception as e:
+                print(f"SQLite get_user_by_email exception: {str(e)}")
+                return None
+
+    def get_user_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+        if self.use_supabase:
+            try:
+                url = f"{self.base_url}/users?id=eq.{user_id}&select=*"
+                res = requests.get(url, headers=self.headers, timeout=10)
+                if res.status_code == 200 and res.json():
+                    return res.json()[0]
+                return None
+            except Exception as e:
+                print(f"Supabase get_user_by_id exception: {str(e)}")
+                return None
+        else:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+                row = cursor.fetchone()
+                conn.close()
+                if row:
+                    cols = [d[0] for d in cursor.description]
+                    return dict(zip(cols, row))
+                return None
+            except Exception as e:
+                print(f"SQLite get_user_by_id exception: {str(e)}")
+                return None
+
+    def verify_user_email(self, user_id: str) -> bool:
+        if self.use_supabase:
+            try:
+                url = f"{self.base_url}/users?id=eq.{user_id}"
+                res = requests.patch(url, headers=self.headers, json={"email_verified": 1}, timeout=10)
+                return res.status_code in (200, 204)
+            except Exception as e:
+                print(f"Supabase verify_user_email exception: {str(e)}")
+                return False
+        else:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET email_verified = 1 WHERE id = ?", (user_id,))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                print(f"SQLite verify_user_email exception: {str(e)}")
+                return False
+
+    def create_verification_token(self, user_id: str, expiry_hours: int = 48) -> Optional[Dict[str, Any]]:
+        token_id = str(uuid.uuid4())
+        token = secrets.token_urlsafe(48)
+        expires_at = (datetime.utcnow() + timedelta(hours=expiry_hours)).isoformat()
+        if self.use_supabase:
+            try:
+                url = f"{self.base_url}/verification_tokens"
+                payload = {"id": token_id, "user_id": user_id, "token": token, "expires_at": expires_at}
+                res = requests.post(url, headers=self.headers, json=payload, timeout=10)
+                if res.status_code in (200, 201):
+                    return {"id": token_id, "token": token, "expires_at": expires_at}
+                return None
+            except Exception as e:
+                print(f"Supabase create_verification_token exception: {str(e)}")
+                return None
+        else:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO verification_tokens (id, user_id, token, expires_at) VALUES (?, ?, ?, ?)",
+                    (token_id, user_id, token, expires_at),
+                )
+                conn.commit()
+                conn.close()
+                return {"id": token_id, "token": token, "expires_at": expires_at}
+            except Exception as e:
+                print(f"SQLite create_verification_token exception: {str(e)}")
+                return None
+
+    def get_verification_token(self, token: str) -> Optional[Dict[str, Any]]:
+        if self.use_supabase:
+            try:
+                url = f"{self.base_url}/verification_tokens?token=eq.{token}&select=*"
+                res = requests.get(url, headers=self.headers, timeout=10)
+                if res.status_code == 200 and res.json():
+                    return res.json()[0]
+                return None
+            except Exception as e:
+                print(f"Supabase get_verification_token exception: {str(e)}")
+                return None
+        else:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM verification_tokens WHERE token = ?", (token,))
+                row = cursor.fetchone()
+                conn.close()
+                if row:
+                    cols = [d[0] for d in cursor.description]
+                    return dict(zip(cols, row))
+                return None
+            except Exception as e:
+                print(f"SQLite get_verification_token exception: {str(e)}")
+                return None
+
+    def use_verification_token(self, token_id: str) -> bool:
+        if self.use_supabase:
+            try:
+                url = f"{self.base_url}/verification_tokens?id=eq.{token_id}"
+                res = requests.patch(url, headers=self.headers, json={"used": 1}, timeout=10)
+                return res.status_code in (200, 204)
+            except Exception as e:
+                print(f"Supabase use_verification_token exception: {str(e)}")
+                return False
+        else:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE verification_tokens SET used = 1 WHERE id = ?", (token_id,))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                print(f"SQLite use_verification_token exception: {str(e)}")
+                return False
+
+    def update_last_signin(self, user_id: str) -> bool:
+        now = datetime.utcnow().isoformat()
+        if self.use_supabase:
+            try:
+                url = f"{self.base_url}/users?id=eq.{user_id}"
+                res = requests.patch(url, headers=self.headers, json={"last_signin_at": now}, timeout=10)
+                return res.status_code in (200, 204)
+            except Exception as e:
+                print(f"Supabase update_last_signin exception: {str(e)}")
+                return False
+        else:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET last_signin_at = ? WHERE id = ?", (now, user_id))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                print(f"SQLite update_last_signin exception: {str(e)}")
+                return False
