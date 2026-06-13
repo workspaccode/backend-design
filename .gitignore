@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+venv/
+brillance.db
+*.db
+.env
+.env.local
