@@ -29,6 +29,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/")
+async def health():
+    return {"status": "ok"}
+
+
 # ComponentTree Schema
 class Bounds(BaseModel):
     w: Optional[float] = 120.0
